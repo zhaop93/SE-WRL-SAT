@@ -45,6 +45,8 @@ struct sense {
   real *sense_vecs;
   int *sememe_num_acc;
   int *sememe_idx;
+  int *example_num_acc;
+  int *example_idx;
 };
 
 
@@ -66,6 +68,8 @@ long long train_words = 0, word_count_actual = 0, iter = 5, file_size = 0;
 
 long long sememe_size = 0;
 
+
+real beta = 0.5;
 
 real alpha = 0.025, starting_alpha, sample = 1e-3;
 real *word_vec, *syn1, *syn1neg, *expTable ;
@@ -103,7 +107,7 @@ void ReadVocabWord(char *word, FILE *fin) {
     if (a >= MAX_STRING - 1)
       --a;
   }
-  word[a] = 0;
+  word[a] = '\0';
 }
 
 
@@ -139,6 +143,7 @@ int SearchSememe(char *word) {
 // Read the word_sense_semem file
 void ReadHowNet() {
   FILE *fin = fopen(read_hownet_file, "rb");
+  printf("%s\n", read_hownet_file);
   if (fin == NULL) {
     printf("HowNet file not found\n");
     exit(1);
@@ -148,6 +153,8 @@ void ReadHowNet() {
   int sememe_ids[111], cnt[111], i, j;
   unsigned long long next_random = 1;
   long long a;
+
+  int example_ids[300], example_cnt[111];
 
   a = posix_memalign((void **)&word_senses, 128, (long long)vocab_size * sizeof(struct sense));
   if (word_senses == NULL) {printf("Memory allocation failed\n"); exit(1);}
@@ -161,7 +168,6 @@ void ReadHowNet() {
     }
   }
 
-
   while (1) {
 
     ReadVocabWord(word, fin);
@@ -171,6 +177,8 @@ void ReadHowNet() {
     int sense_num = ReadInteger(fin);
 
     if (sense_num > 1) {
+        //printf("%ld", sense_num);
+
       for (i = 0; i < sense_num; ++i) {
         int sememe_cnt = ReadInteger(fin);
         int sememe_id_tmp;
@@ -187,8 +195,24 @@ void ReadHowNet() {
             sememe_ids[j] = sememe_id_tmp;
           }
         }
+
+        // read example
+        int example_tot = ReadInteger(fin);
+        example_cnt[i] = (i == 0 ? 0 : example_cnt[i - 1]) + example_tot;
+        //printf("%ld\n", example_cnt);
+        for (j = (i == 0 ? 0 : example_cnt[i - 1]); j < example_cnt[i]; j++) {
+            ReadVocabWord(word, fin);
+            int example_id = SearchVocab(word);
+            if (example_id == -1) {
+                j--;
+                example_cnt[i]--;
+            } else {
+                example_ids[j] = example_id;
+            }
+        }
       }
     }
+
     if (word_id != -1) {
       word_senses[word_id].num = sense_num;
 
@@ -207,9 +231,23 @@ void ReadHowNet() {
         word_senses[word_id].sememe_idx = (int *)calloc(word_senses[word_id].sememe_num_acc[sense_num - 1], sizeof(int));
         for (i = 0; i < word_senses[word_id].sememe_num_acc[sense_num - 1]; ++i)
           word_senses[word_id].sememe_idx[i] = sememe_ids[i];
+
+        //example
+        word_senses[word_id].example_num_acc = (int *)calloc(sense_num, sizeof(int));
+        for (i = 0; i < sense_num; i++) {
+            word_senses[word_id].example_num_acc[i] = example_cnt[i];
+        }
+        //printf("%d\n", sense_num);
+        //printf("word senses: %d\n", word_senses[word_id].example_num_acc[sense_num - 1]);
+        word_senses[word_id].example_idx = (int *)calloc(word_senses[word_id].example_num_acc[sense_num - 1], sizeof(int));
+        for (i = 0; i < word_senses[word_id].example_num_acc[sense_num - 1]; i++) {
+            word_senses[word_id].example_idx[i] = example_ids[i];
+            //printf("example_ids[i] = %ld\n", word_senses[word_id].example_idx[i]);
+        }
       }
     }
   }
+
   printf("HowNet Read End\n");
   fflush(stdout);
 }
@@ -411,6 +449,7 @@ void ReadSememe() {
   fclose(fin);
   printf("Sememe Number: %lld\n", sememe_size);
   fflush(stdout);
+  printf("finish sememe\n");
 }
 
 // Initialize the vectors
@@ -475,6 +514,8 @@ void *TrainModelThread(void *id) {
   real *mult_part2 = (real *)calloc(vec_dim, sizeof(real));
   real *avg_sememe = (real *)calloc(vec_dim * 35, sizeof(real));
   real total = 0;
+
+  real *avg_example = (real *)calloc(vec_dim * 350, sizeof(real));
 
 
   while (1) {
@@ -619,7 +660,52 @@ void *TrainModelThread(void *id) {
                 _exp[p] = vectorDot(&(avg_sememe[p * vec_dim]), context_vec, vec_dim);
                 if (_exp[p] < min_exp)
                   min_exp = _exp[p];
+
+                // calc the average of example embeddings for each sense
+                for (q = 0; q < vec_dim; ++q) {
+                    avg_example[p * vec_dim + q] = 0;
+                }
+                for (q = (p == 0 ? 0 : word_senses[target].example_num_acc[p - 1]); q < word_senses[target].example_num_acc[p]; ++q) {
+                    real *example_tmp = &(word_vec[word_senses[target].example_idx[q] * vec_dim]);
+                    for (c = 0; c < vec_dim; c++) {
+                        avg_example[p * vec_dim + c] += example_tmp[c];
+                    }
+                }
+                real divide_example = 1.0;
+                if (p == 0) {
+                    if (word_senses[target].example_num_acc[0] != 0) {
+                        divide_example = 1.0 / (real)(word_senses[target].example_num_acc[0]);
+                    }
+                } else {
+                    if (word_senses[target].example_num_acc[p] - word_senses[target].example_num_acc[p - 1] > 0) {
+                        divide_example = 1.0 / (real)(word_senses[target].example_num_acc[p] - word_senses[target].example_num_acc[p - 1]);
+                    }
+                }
+                for (c = 0; c < vec_dim; c++) {
+                    avg_example[p * vec_dim + c] *= divide_example;
+                }
               }
+
+              /*
+              for (q = 0; q < vec_dim; q++) {
+                  avg_example[q] = 0;
+              }
+              for (p = 0; p < word_senses[target].example_num_acc[word_senses[target].num - 1]; p++) {
+                  int example_id = word_senses[target].example_idx[p];
+                  for (q = 0; q < vec_dim; q++) {
+                      avg_example[q] += word_vec[example_id * vec_dim + q];
+                  }
+              }
+              real divide_example = 1.0;
+              if (word_senses[target].example_num_acc[word_senses[target].num - 1] != 0) {
+                  divide_example = 1.0 / (real) (word_senses[target].example_num_acc[word_senses[target].num - 1]);
+              }
+
+              for (q = 0; q < vec_dim; q++) {
+                  avg_example[q] *= divide_example;
+              }
+              */
+
               for (p = 0; p < word_senses[target].num; ++p) {
                 _exp[p] = _exp[p] - min_exp;
                 if (_exp[p] >= 3.999)
@@ -631,7 +717,10 @@ void *TrainModelThread(void *id) {
               for (p = 0; p < word_senses[target].num; ++p) {
                 _exp[p] = _exp[p] / temp_total;
                 for (q = 0; q < vec_dim; ++q) {
-                  attention[q] += _exp[p] * word_senses[target].sense_vecs[p * vec_dim + q];
+                  attention[q] += (1.0 - beta) * _exp[p] * word_senses[target].sense_vecs[p * vec_dim + q];
+
+                  attention[q] += beta * _exp[p] * avg_example[p * vec_dim + q];
+
                   attention_avg[q] += _exp[p] * avg_sememe[p * vec_dim + q];
                 }
               }
@@ -642,6 +731,7 @@ void *TrainModelThread(void *id) {
             for (c = 0; c < vec_dim; c++) {
               f += word_vec[c + l1] * attention[c];
             }
+
             if (f > MAX_EXP)
               g = (label - 1) * alpha;
             else if (f < -MAX_EXP)
@@ -730,6 +820,7 @@ void *TrainModelThread(void *id) {
   free(mult_part);
   free(mult_part2);
   free(avg_sememe);
+  free(avg_example);
 
 
   printf("train end\n");
